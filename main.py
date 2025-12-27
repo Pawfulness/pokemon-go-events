@@ -6,6 +6,7 @@ from dateutil import parser
 import threading
 import time
 import os
+from threading import Lock
 
 app = FastAPI()
 
@@ -19,6 +20,13 @@ app.add_middleware(
 
 DATA_URL = "https://raw.githubusercontent.com/bigfoott/ScrapedDuck/data/events.json"
 
+events_cache = {
+    "events": [],
+    "last_updated": None,
+}
+_cache_lock = Lock()
+_refresh_in_progress = False
+
 def fetch_events():
     try:
         response = requests.get(DATA_URL)
@@ -27,6 +35,24 @@ def fetch_events():
     except Exception as e:
         print(f"Error fetching events: {e}")
         return []
+
+
+def refresh_cache() -> bool:
+    global _refresh_in_progress
+    with _cache_lock:
+        if _refresh_in_progress:
+            return False
+        _refresh_in_progress = True
+
+    try:
+        data = fetch_events() or []
+        with _cache_lock:
+            events_cache["events"] = data
+            events_cache["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return True
+    finally:
+        with _cache_lock:
+            _refresh_in_progress = False
 
 def format_date(date_str):
     try:
@@ -37,7 +63,11 @@ def format_date(date_str):
 
 @app.get("/api/events")
 def get_events():
-    raw_events = fetch_events()
+    # Prefer cached data (refreshed daily by systemd timer).
+    raw_events = events_cache.get("events") or []
+    if not raw_events:
+        refresh_cache()
+        raw_events = events_cache.get("events") or []
     current_time = datetime.now()
     
     upcoming_events = []
@@ -75,6 +105,16 @@ def get_events():
         })
         
     return {"slides": slides}
+
+
+@app.post("/api/refresh")
+def refresh_now():
+    did_start = refresh_cache()
+    return {
+        "status": "ok" if did_start else "already_running",
+        "in_progress": _refresh_in_progress,
+        "last_updated": events_cache.get("last_updated"),
+    }
 
 @app.get("/")
 def root():

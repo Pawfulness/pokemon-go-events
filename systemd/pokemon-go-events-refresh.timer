@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule Pokemon Go Events daily refresh
+
+[Timer]
+OnCalendar=*-*-* 00:02:00
+Persistent=true
+Unit=pokemon-go-events-refresh.service
+
+[Install]
+WantedBy=timers.target

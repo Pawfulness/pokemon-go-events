@@ -1,0 +1,17 @@
+[Unit]
+Description=Pokemon Go Events Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/pokemon-go-events
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/admin/pokemon-go-events/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
