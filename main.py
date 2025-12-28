@@ -7,6 +7,7 @@ import threading
 import time
 import os
 from threading import Lock
+import re
 
 app = FastAPI()
 
@@ -54,12 +55,43 @@ def refresh_cache() -> bool:
         with _cache_lock:
             _refresh_in_progress = False
 
-def format_date(date_str):
+def _parse_dt_utc(date_str: str | None) -> datetime | None:
+    if not date_str:
+        return None
     try:
         dt = parser.parse(date_str)
-        return dt.strftime("%b %d, %H:%M")
-    except:
-        return date_str
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        # LeekDuck / ScrapedDuck timestamps are typically local-ish strings;
+        # treat naive times as UTC for consistent comparisons/display.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def format_date(date_str: str | None) -> str:
+    dt = _parse_dt_utc(date_str)
+    if not dt:
+        return (date_str or "").strip()
+    return dt.strftime("%b %d, %H:%M")
+
+
+def _norm_heading(s: str | None) -> str:
+    t = (s or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _event_to_list_item(event: dict) -> dict:
+    start_str = format_date(event.get("start"))
+    end_str = format_date(event.get("end"))
+    return {
+        "title": (event.get("name") or "").strip(),
+        "subtitle": "",
+        "imageUrl": event.get("image"),
+        "value": f"{start_str} - {end_str}".strip(" -"),
+        "url": event.get("link"),
+    }
 
 @app.get("/api/events")
 def get_events():
@@ -68,42 +100,86 @@ def get_events():
     if not raw_events:
         refresh_cache()
         raw_events = events_cache.get("events") or []
-    current_time = datetime.now()
-    
-    upcoming_events = []
-    
+    now = datetime.now(timezone.utc)
+
+    # Filter to currently active events (started and not ended).
+    current_events: list[dict] = []
     for event in raw_events:
-        try:
-            end_time = parser.parse(event.get("end"))
-            # Filter out events that have already ended
-            # Note: The feed might contain local times without timezone, assuming local to user or UTC?
-            # LeekDuck usually uses local time for events, but the ISO string might be interpreted.
-            # We'll just compare naively if no tzinfo, or aware if present.
-            
-            if end_time.tzinfo is None:
-                end_time = end_time.replace(tzinfo=None)
-                
-            if end_time > current_time:
-                upcoming_events.append(event)
-        except:
+        start_dt = _parse_dt_utc(event.get("start"))
+        end_dt = _parse_dt_utc(event.get("end"))
+        if not start_dt or not end_dt:
             continue
-            
-    # Sort by start time
-    upcoming_events.sort(key=lambda x: x.get("start"))
-    
-    slides = []
-    for event in upcoming_events[:10]: # Limit to 10 events
-        start_str = format_date(event.get("start"))
-        end_str = format_date(event.get("end"))
-        
-        slides.append({
-            "title": event.get("name"),
-            "subtitle": event.get("heading"),
-            "imageUrl": event.get("image"),
-            "value": f"{start_str} - {end_str}",
-            "url": event.get("link")
-        })
-        
+        if start_dt <= now <= end_dt:
+            current_events.append(event)
+
+    # Group by heading/tag (e.g., Raid Battles, Events, Research, Timed Research, ...)
+    grouped: dict[str, list[dict]] = {}
+    for ev in current_events:
+        heading = _norm_heading(ev.get("heading")) or "Other"
+        grouped.setdefault(heading, []).append(ev)
+
+    # Sort within each group by end time (soonest ending first)
+    for heading, evs in grouped.items():
+        evs.sort(key=lambda e: (_parse_dt_utc(e.get("end")) or now))
+
+    slides: list[dict] = []
+
+    # Combine Season + GO Pass into a single split slide.
+    season = grouped.pop("Season", [])
+    go_pass = grouped.pop("GO Pass", [])
+    if season or go_pass:
+        slides.append(
+            {
+                "type": "split-slide",
+                "title": "GO Pass",
+                "subtitle": "Current",
+                "items": [_event_to_list_item(e) for e in go_pass][:5],
+                "rightTitle": "Season",
+                "rightSubtitle": "Current",
+                "rightItems": [_event_to_list_item(e) for e in season][:5],
+                "url": "https://leekduck.com/events/",
+            }
+        )
+
+    # Prefer Raid Battles early since it's a frequently-checked category.
+    raid = grouped.pop("Raid Battles", [])
+    if raid:
+        slides.append(
+            {
+                "title": "Current Raid Battles",
+                "subtitle": "Raid Battles",
+                "items": [_event_to_list_item(e) for e in raid][:10],
+                "url": "https://leekduck.com/events/",
+            }
+        )
+
+    # Remaining groups in stable alphabetical order.
+    for heading in sorted(grouped.keys()):
+        evs = grouped[heading]
+        if not evs:
+            continue
+        slides.append(
+            {
+                "title": f"Current {heading}",
+                "subtitle": heading,
+                "items": [_event_to_list_item(e) for e in evs][:10],
+                "url": "https://leekduck.com/events/",
+            }
+        )
+
+    if not slides:
+        return {
+            "slides": [
+                {
+                    "title": "No current events",
+                    "subtitle": "Pokemon GO",
+                    "value": "No active events right now",
+                    "imageUrl": "https://cdn.leekduck.com/assets/img/events/events-default-img.jpg",
+                    "url": "https://leekduck.com/events/",
+                }
+            ]
+        }
+
     return {"slides": slides}
 
 
