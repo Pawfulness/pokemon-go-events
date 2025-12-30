@@ -1,7 +1,7 @@
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil import parser
 import threading
 import time
@@ -20,6 +20,8 @@ app.add_middleware(
 )
 
 DATA_URL = "https://raw.githubusercontent.com/bigfoott/ScrapedDuck/data/events.json"
+EXCLUDED_HEADINGS = {"go battle league"}
+UPCOMING_WINDOW_DAYS = 30
 
 events_cache = {
     "events": [],
@@ -82,14 +84,28 @@ def _norm_heading(s: str | None) -> str:
     return t
 
 
-def _event_to_list_item(event: dict) -> dict:
-    start_str = format_date(event.get("start"))
-    end_str = format_date(event.get("end"))
+def _is_excluded_heading(heading: str | None) -> bool:
+    h = _norm_heading(heading).casefold()
+    return h in EXCLUDED_HEADINGS
+
+
+def _event_to_list_item(
+    event: dict,
+    subtitle_override: str | None = None,
+    value_override: str | None = None,
+) -> dict:
+    if value_override is not None:
+        value = value_override.strip()
+    else:
+        start_str = format_date(event.get("start"))
+        end_str = format_date(event.get("end"))
+        value = f"{start_str} - {end_str}".strip(" -")
+
     return {
         "title": (event.get("name") or "").strip(),
-        "subtitle": "",
+        "subtitle": (subtitle_override or "").strip(),
         "imageUrl": event.get("image"),
-        "value": f"{start_str} - {end_str}".strip(" -"),
+        "value": value,
         "url": event.get("link"),
     }
 
@@ -101,32 +117,63 @@ def get_events():
         refresh_cache()
         raw_events = events_cache.get("events") or []
     now = datetime.now(timezone.utc)
+    upcoming_cutoff = now + timedelta(days=UPCOMING_WINDOW_DAYS)
 
     # Filter to currently active events (started and not ended).
     current_events: list[dict] = []
+    upcoming_events: list[dict] = []
     for event in raw_events:
         start_dt = _parse_dt_utc(event.get("start"))
         end_dt = _parse_dt_utc(event.get("end"))
         if not start_dt or not end_dt:
             continue
+        if _is_excluded_heading(event.get("heading")):
+            continue
+
         if start_dt <= now <= end_dt:
             current_events.append(event)
+        elif start_dt > now and start_dt <= upcoming_cutoff:
+            upcoming_events.append(event)
 
     # Group by heading/tag (e.g., Raid Battles, Events, Research, Timed Research, ...)
-    grouped: dict[str, list[dict]] = {}
+    grouped_current: dict[str, list[dict]] = {}
     for ev in current_events:
         heading = _norm_heading(ev.get("heading")) or "Other"
-        grouped.setdefault(heading, []).append(ev)
+        grouped_current.setdefault(heading, []).append(ev)
 
-    # Sort within each group by end time (soonest ending first)
-    for heading, evs in grouped.items():
+    # Sunday-only: add a synthetic "Trade Day" into the existing current Event(s) group.
+    # ScrapedDuck sometimes uses "Event" vs "Events"; prefer whichever is present so it lands
+    # on the same slide as the other current event items.
+    local_now = datetime.now().astimezone()
+    if local_now.weekday() == 6:  # Sunday
+        target_heading = "Event" if "Event" in grouped_current else "Events"
+        grouped_current.setdefault(target_heading, []).append(
+            {
+                "name": "Trade Day",
+                "heading": target_heading,
+                "image": "https://cdn.leekduck.com/assets/img/events/events-default-img.jpg",
+                "link": "https://leekduck.com/events/",
+            }
+        )
+
+    grouped_upcoming: dict[str, list[dict]] = {}
+    for ev in upcoming_events:
+        heading = _norm_heading(ev.get("heading")) or "Other"
+        grouped_upcoming.setdefault(heading, []).append(ev)
+
+    # Sort within each group
+    # - current: end time (soonest ending first)
+    # - upcoming: start time (soonest starting first)
+    for heading, evs in grouped_current.items():
         evs.sort(key=lambda e: (_parse_dt_utc(e.get("end")) or now))
+    for heading, evs in grouped_upcoming.items():
+        evs.sort(key=lambda e: (_parse_dt_utc(e.get("start")) or now))
 
     slides: list[dict] = []
 
     # Combine Season + GO Pass into a single split slide.
-    season = grouped.pop("Season", [])
-    go_pass = grouped.pop("GO Pass", [])
+    season = grouped_current.pop("Season", [])
+    go_pass = grouped_current.pop("GO Pass", [])
     if season or go_pass:
         slides.append(
             {
@@ -141,8 +188,24 @@ def get_events():
             }
         )
 
+    # Combine Research + Timed Research into a single slide.
+    research = grouped_current.pop("Research", [])
+    timed_research = grouped_current.pop("Timed Research", [])
+    if research or timed_research:
+        combined = [("Research", e) for e in research] + [("Timed Research", e) for e in timed_research]
+        combined.sort(key=lambda pair: (_parse_dt_utc(pair[1].get("end")) or now, pair[0], (pair[1].get("name") or "")))
+        slides.append(
+            {
+                "title": "Current research",
+                "subtitle": "Research + Timed Research",
+                "maxItems": 50,
+                "items": [_event_to_list_item(e, subtitle_override=label) for label, e in combined],
+                "url": "https://leekduck.com/events/",
+            }
+        )
+
     # Prefer Raid Battles early since it's a frequently-checked category.
-    raid = grouped.pop("Raid Battles", [])
+    raid = grouped_current.pop("Raid Battles", [])
     if raid:
         slides.append(
             {
@@ -154,8 +217,8 @@ def get_events():
         )
 
     # Remaining groups in stable alphabetical order.
-    for heading in sorted(grouped.keys()):
-        evs = grouped[heading]
+    for heading in sorted(grouped_current.keys()):
+        evs = grouped_current[heading]
         if not evs:
             continue
         slides.append(
@@ -163,6 +226,31 @@ def get_events():
                 "title": f"Current {heading}",
                 "subtitle": heading,
                 "items": [_event_to_list_item(e) for e in evs][:10],
+                "url": "https://leekduck.com/events/",
+            }
+        )
+
+    # Upcoming (next N days) — single slide, ordered by start time.
+    if upcoming_events:
+        upcoming_events.sort(
+            key=lambda e: (
+                _parse_dt_utc(e.get("start")) or now,
+                (_norm_heading(e.get("heading")) or "Other"),
+                (e.get("name") or ""),
+            )
+        )
+        slides.append(
+            {
+                "title": "Upcoming events",
+                "subtitle": f"Next {UPCOMING_WINDOW_DAYS} days",
+                "maxItems": 200,
+                "items": [
+                    _event_to_list_item(
+                        e,
+                        subtitle_override=_norm_heading(e.get("heading")) or "Other",
+                    )
+                    for e in upcoming_events
+                ],
                 "url": "https://leekduck.com/events/",
             }
         )
